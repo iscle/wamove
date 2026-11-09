@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 
 from . import __version__
 from .android import adb, crypt15, msgstore
+from . import stickers
 from .android import xpm as android_xpm
 from .ios import backup as ios_backup
 from .ios import chatstorage, device
@@ -256,12 +258,33 @@ def export(work: Work, args: argparse.Namespace) -> None:
     work.export.mkdir(mode=0o700, parents=True, exist_ok=True)
     scratch = work.export / "msgstore-edit"
     saved = None if args.keep_live_locations else android_xpm.clear_sent_live_location_finals(scratch)
+    changed_stickers = False
+    stickers_before: bool | None = None  # if setting it fails part-way, remove it again
     try:
+        if not args.no_stickers:
+            changed_stickers = True
+            stickers_before = android_xpm.set_sticker_export(scratch, True)
+            print("  turned on WhatsApp's export of saved stickers (favorites and recents)")
         print("Running WhatsApp's own Move to iOS export. WhatsApp on Android logs out when it finishes.")
-        android_xpm.run_export()
+        log = android_xpm.run_export()
+        for line in log.splitlines():
+            if android_xpm.STICKER_LOG in line:
+                print("  " + line[line.index(android_xpm.STICKER_LOG):])
     finally:
+        # Each restore runs even if the other fails; the first error is the one reported.
+        errors: list[BaseException] = []
         if saved:
-            android_xpm.restore_sent_live_location_finals(scratch, saved)
+            try:
+                android_xpm.restore_sent_live_location_finals(scratch, saved)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+        if changed_stickers and stickers_before is not True:
+            try:
+                android_xpm.set_sticker_export(scratch, stickers_before)
+            except Exception as e:  # noqa: BLE001
+                print(f"  warning: could not put WhatsApp's sticker export setting back ({e})")
+        if errors:
+            raise errors[0]
     collect(work, args)
 
 
@@ -273,6 +296,82 @@ def collect(work: Work, args: argparse.Namespace) -> None:
     summary = ios_xpm.check_export(files, key, work.export, media)
     chunks = summary["header"]["messages"]["chunks"]
     print(f"  {len(chunks)} chunks, {sum(c['messages_count'] for c in chunks)} messages, {len(files)} files")
+    report_stickers(work, files, media)
+
+
+def report_stickers(work: Work, files: list, media: Path | None) -> None:
+    """Best effort: saved stickers are not worth failing an export over."""
+    try:
+        messages = next(f for f in files if f.exported_path == "migration/messages_export.zip")
+        carried = stickers.carried_by_export(android_xpm.local_copy(messages, work.export, media))
+        saved = stickers.saved_on_android(work.export / "stickers")
+    except Exception as e:  # noqa: BLE001
+        print(f"  warning: could not count the saved stickers in the export ({type(e).__name__}: {e})")
+        return
+    print(f"  saved stickers in the export: {carried.favorites} favorites, {carried.recents} recents"
+          + (f" (Android has {saved.favorites} and {saved.recents})" if saved else ""))
+    if saved and saved.favorites and not carried.favorites:
+        print("  warning: WhatsApp left your favorite stickers out of the export. After the import on the iPhone,"
+              " `wamove stickers --phone <number>` can add them (see the README).")
+
+
+FAVSTICKERS = Path(__file__).resolve().parents[2] / "tools" / "favstickers"
+
+
+def sticker_sync(work: Work, args: argparse.Namespace) -> None:
+    """Add Android's favorite stickers to WhatsApp on the iPhone through a temporary linked device."""
+    store = work.export / "stickers"
+    if not (store / "stickers.db").is_file():
+        raise Failure("the sticker store was not copied from Android; run `wamove collect` first")
+    if not (FAVSTICKERS / "main.go").is_file():
+        raise Failure(f"the sticker tool is missing ({FAVSTICKERS}); run wamove from its source checkout")
+    if not shutil.which("go"):
+        raise Failure("the sticker tool needs Go: brew install go")
+    phone = "".join(ch for ch in args.phone if ch.isdigit())
+    target = work.root / "sticker-sync"
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    count, missing = stickers.write_favorites(store, target / "favorites.json")
+    print(f"{count} favorite stickers to add" + (f"; {len(missing)} have no file and are skipped" if missing else ""))
+    if not count:
+        return
+    print("This links a temporary device to your WhatsApp account through whatsmeow, an unofficial client, adds the\n"
+          "favorites the way WhatsApp's own linked devices do, and unlinks it again. Unofficial clients are against\n"
+          "WhatsApp's terms; use at your own risk. Only do this after the import on the iPhone has finished.")
+    if not args.yes and input("Continue? [y/N] ").strip().lower() != "y":
+        return
+    binary = target / "favstickers"
+    if subprocess.run(["go", "build", "-o", str(binary), "."], cwd=FAVSTICKERS).returncode:
+        raise Failure("building the sticker tool failed (see above)")
+    session = target / "session.db"
+    if not session.exists():
+        # A new linked session sends everything again (sending a favorite twice is harmless); done.txt only
+        # resumes an interrupted run within the same session.
+        (target / "done.txt").unlink(missing_ok=True)
+
+    def tool(*argv: str) -> None:
+        if subprocess.run([str(binary), *argv], cwd=target).returncode:
+            raise Failure(f"the sticker tool failed ({' '.join(argv)})")
+
+    print("On the iPhone: WhatsApp > Settings > Linked devices > Link a device > Link with phone number instead,\n"
+          "then enter the code below.")
+    linked = False
+    try:
+        tool("pair", phone)
+        linked = True
+        tool("send", "-limit", "1")
+        if not args.yes:
+            input("One favorite was sent. Check the favorites tab of the sticker picker on the iPhone, then press "
+                  "Enter… ")
+        tool("send")
+    except BaseException:
+        if linked:
+            print("Stopped before finishing. Run `wamove stickers` again to finish (it resumes), or unlink the "
+                  "\"Chrome (Mac OS)\" device in WhatsApp > Settings > Linked devices.")
+        raise
+    tool("unlink")
+    for name in ("session.db", "session.db-wal", "session.db-shm", "done.txt"):
+        (target / name).unlink(missing_ok=True)
+    print("Done: the favorites are on the iPhone and the temporary device is unlinked.")
 
 
 def plant(work: Work, args: argparse.Namespace) -> None:
@@ -430,7 +529,13 @@ def main(argv: list[str] | None = None) -> int:
     command = commands.add_parser("export", help="run WhatsApp's own Move to iOS export on the rooted Android phone")
     command.add_argument("--keep-live-locations", action="store_true",
                          help="do not work around the exporter crash on sent live locations")
+    command.add_argument("--no-stickers", action="store_true",
+                         help="do not turn on WhatsApp's export of saved stickers")
     commands.add_parser("collect", help="copy a finished export off the Android phone again, without exporting")
+    command = commands.add_parser("stickers", help="add Android's favorite stickers to the iPhone after the import "
+                                                   "(links a temporary unofficial device)")
+    command.add_argument("--phone", required=True, help="your WhatsApp number in international format")
+    command.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     commands.add_parser("backup", help="back up the iPhone and keep a WhatsApp-only copy")
     commands.add_parser("plant", help="put the Android export where WhatsApp on the iPhone imports it from")
     command = commands.add_parser("build", help="add the Android chats to the WhatsApp-only copy")
@@ -447,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
         "decrypt": lambda: decrypt(work, args),
         "export": lambda: export(work, args),
         "collect": lambda: collect(work, args),
+        "stickers": lambda: sticker_sync(work, args),
         "backup": lambda: backup(work, args),
         "plant": lambda: plant(work, args),
         "build": lambda: build(work, args),

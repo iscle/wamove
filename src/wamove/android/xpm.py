@@ -36,6 +36,15 @@ KEY_FIELDS = ("owner", "version", "account_hash", "server_salt", "seed")
 DONE = "xpm-export-service-onComplete"
 # Written by `collect` as its very last step: without it the copy on this Mac may be missing files.
 COLLECTED = ".collected"
+AB_PROPS = f"{DATA}/shared_prefs/ab-props.xml"
+# WhatsApp's exporter adds the recent and favorite sticker lists (HistorySync fields 11 and 22, which WhatsApp on
+# the iPhone imports into its sticker tray) only when this server A/B property is on
+# (ChatTransferStickerExporter/addStickerLists, checked in the exporter of 2.26.43.76). It is off by default, so
+# saved stickers are silently left out. wamove turns it on locally for the export and puts the original back.
+STICKER_EXPORT_PROP = "38696"
+STICKERS_DB = f"{DATA}/databases/stickers.db"
+STICKER_FILES = f"{DATA}/files/Stickers"
+STICKER_LOG = "ChatTransferStickerExporter/addStickerLists"
 FAILED = "xpm-export-service-onError"
 SHARED_MEDIA_ROOTS = (
     "/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/",
@@ -200,6 +209,99 @@ def restore_sent_live_location_finals(scratch: Path, saved: Path) -> None:
     print(f"  put back the final position of {len(rows)} sent live locations")
 
 
+def with_ab_prop(xml: str, name: str, value: bool | None) -> str:
+    """ab-props.xml with boolean property `name` set to `value`, or removed when `value` is None."""
+    xml = re.sub(rf'\n?[ \t]*<boolean name="{re.escape(name)}" value="(?:true|false)" ?/>', "", xml)
+    if value is not None:
+        entry = f'    <boolean name="{name}" value="{str(value).lower()}" />\n'
+        if "</map>" in xml:
+            xml = xml.replace("</map>", entry + "</map>", 1)
+        else:  # an empty map is written as <map />
+            xml = re.sub(r"<map\s*/>", "<map>\n" + entry + "</map>", xml, count=1)
+    ET.fromstring(xml)  # still a valid preferences file
+    return xml
+
+
+def ab_prop(xml: str, name: str) -> bool | None:
+    for el in ET.fromstring(xml):
+        if el.tag == "boolean" and el.get("name") == name:
+            return el.get("value") == "true"
+    return None
+
+
+def set_sticker_export(scratch: Path, value: bool | None) -> bool | None:
+    """Set the sticker export property with WhatsApp stopped (it rewrites its preferences from memory otherwise).
+    Returns the value it had before."""
+    stop()
+    scratch.mkdir(parents=True, exist_ok=True)
+    local = scratch / "ab-props.xml"
+    if remote_size(AB_PROPS) is None:
+        xml = "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map />\n"
+    else:
+        read_file(AB_PROPS, local)
+        xml = local.read_text(encoding="utf-8")
+    before = ab_prop(xml, STICKER_EXPORT_PROP)
+    if before == value:
+        return before
+    local.write_text(with_ab_prop(xml, STICKER_EXPORT_PROP, value), encoding="utf-8")
+    write_file(local, AB_PROPS, before=f"am force-stop {PACKAGE} &&")
+    return before
+
+
+def _varint(data: bytes, i: int) -> tuple[int, int]:
+    shift = result = 0
+    while True:
+        byte = data[i]
+        i += 1
+        result |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return result, i
+
+
+def _stream_varint(stream) -> int | None:
+    shift = result = 0
+    while True:
+        byte = stream.read(1)
+        if not byte:
+            if shift:
+                raise ExportError("messages.bin ends in the middle of a chunk length")
+            return None
+        result |= (byte[0] & 0x7F) << shift
+        shift += 7
+        if byte[0] < 0x80:
+            return result
+
+
+def history_sync_field_counts(messages_bin) -> dict[int, int]:
+    """How often each top-level HistorySync field occurs across the length-prefixed chunks of messages.bin
+    (bytes or a binary stream; chunks are read one at a time)."""
+    import io
+    stream = io.BytesIO(messages_bin) if isinstance(messages_bin, (bytes, bytearray)) else messages_bin
+    counts: dict[int, int] = {}
+    while (size := _stream_varint(stream)) is not None:
+        chunk = stream.read(size)
+        if len(chunk) != size:
+            raise ExportError("messages.bin ends in the middle of a chunk")
+        j = 0
+        while j < len(chunk):
+            key, j = _varint(chunk, j)
+            field, wire = key >> 3, key & 7
+            if wire == 0:
+                _, j = _varint(chunk, j)
+            elif wire == 1:
+                j += 8
+            elif wire == 5:
+                j += 4
+            elif wire == 2:
+                length, j = _varint(chunk, j)
+                j += length
+            else:
+                raise ExportError(f"messages.bin: unexpected protobuf wire type {wire}")
+            counts[field] = counts.get(field, 0) + 1
+    return counts
+
+
 def run_export(timeout_s: int = 6 * 3600) -> str:
     start = log_length()
     su(f"am start-foreground-service -n {SERVICE} -a ACTION_START_EXPORT")
@@ -273,8 +375,25 @@ def collect(target: Path, media_mirror: Path | None) -> tuple[list[ExportedFile]
         read_file(item.local_path, sandbox / item.local_path.lstrip("/"))
         pulled += 1
     print(f"  {len(files)} files in the export: {pulled} copied from the phone, {reused} already on this Mac")
+    try:
+        collect_stickers(target / "stickers")
+    except Exception as e:  # noqa: BLE001 - the sticker store is optional; the export is complete without it
+        print(f"  warning: could not copy the sticker store ({type(e).__name__}: {e})")
     (target / COLLECTED).write_text(json.dumps({"files": len(files), "pulled": pulled, "reused": reused}))
     return files, key
+
+
+def collect_stickers(target: Path) -> None:
+    """Copy WhatsApp's sticker store (saved stickers and their files), for `wamove stickers`."""
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True)
+    for suffix in ("", "-wal", "-shm"):
+        if remote_size(STICKERS_DB + suffix) is not None:
+            read_file(STICKERS_DB + suffix, target / f"stickers.db{suffix}")
+    names = [n.strip() for n in su(f"ls {STICKER_FILES} 2>/dev/null").splitlines() if n.strip().endswith(".webp")]
+    for name in names:
+        read_file(f"{STICKER_FILES}/{name}", target / "files" / name)
+    print(f"  copied the sticker store ({len(names)} sticker files)")
 
 
 def local_copy(item: ExportedFile, target: Path, media_mirror: Path | None) -> Path:

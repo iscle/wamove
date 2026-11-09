@@ -41,7 +41,27 @@ or, without cloning:
 uv tool install --python 3.13 git+https://github.com/alicin/wamove.git
 ```
 
-## Moving your chats
+## With a rooted Android phone: WhatsApp's own transfer (recommended)
+
+If the Android phone is rooted, wamove can let WhatsApp move everything itself. It runs WhatsApp's own Move to iOS exporter on the Android phone, puts the result where WhatsApp on the iPhone looks for a Move to iOS import, and restores only WhatsApp's data. After registering, WhatsApp on the iPhone imports the history with its own code: groups, reactions, polls, edits, system messages, call logs and media included.
+
+1. Make sure the shell can get root (`adb shell su -c id`). **Never open Settings → Chats → Transfer chats on the Android phone:** it tells WhatsApp's server that a phone-to-phone transfer is coming, and the iPhone then shows a QR code instead of importing (if that already happened, see below).
+2. On the iPhone, install WhatsApp but do not register it. Turn off Find My and **Personal Hotspot** (the iPhone drops its hotspot USB link when a restore begins, and the USB reconfiguration that follows cuts the restore off). Quit Xcode, Photos, Image Capture, QuickTime, Console and AltServer.
+
+```sh
+wamove export     # WhatsApp's exporter on Android; WhatsApp on Android logs out when it finishes
+wamove backup     # full iPhone backup, then a WhatsApp-only copy
+wamove plant      # adds the export to the WhatsApp-only copy, encrypted like Move to iOS delivers it
+wamove restore    # the iPhone restarts when done
+```
+
+3. Register WhatsApp on the iPhone with the same number. It offers to import the chats from Android; keep it open until it finishes. Do not log in on the Android phone again.
+
+If it asks you to scan a QR code on the other phone instead, cancel, then skip the "transfer chat history from another phone" screen (do not choose iPhone or Android): the import follows.
+
+**Saved stickers.** WhatsApp's exporter carries favorite and recent stickers only when a server A/B property is on, which it usually is not, so `export` turns it on locally for the export and puts it back afterwards (`--no-stickers` skips that), then reports how many the export carries. This path has not yet been confirmed end to end. If the export still lacks them, `wamove stickers --phone <number>` adds the favorites after the import: it links a temporary device to your account with [whatsmeow](https://github.com/tulir/whatsmeow), an unofficial client (against WhatsApp's terms; use at your own risk; needs Go and a source checkout of wamove, since the tool lives in `tools/favstickers`), adds each favorite the way WhatsApp's linked devices sync them, and unlinks again. Recent stickers cannot be added that way.
+
+## Moving your chats from a chat backup
 
 ### 1. On the Android phone
 
@@ -90,7 +110,11 @@ When you are happy, delete `~/wamove`. It holds your decrypted chats.
 | `backup` | Takes a full iPhone backup and makes the WhatsApp-only copy |
 | `inspect` | Shows the Android chats and what is in the iPhone's WhatsApp database |
 | `build [--no-media]` | Writes the Android chats (and media) into the WhatsApp-only copy and checks the result |
-| `restore` | Restores the built copy to the iPhone |
+| `export [--keep-live-locations] [--no-stickers]` | Runs WhatsApp's own Move to iOS export on the rooted Android phone and copies it to the Mac |
+| `collect` | Copies a finished export off the Android phone again, without exporting |
+| `plant` | Adds the export to the WhatsApp-only copy, where WhatsApp on the iPhone imports it from |
+| `stickers --phone NUMBER [--yes]` | After the import, adds Android's favorite stickers through a temporary unofficial linked device |
+| `restore` | Restores the built or planted copy to the iPhone |
 | `rollback` | Restores the untouched WhatsApp-only copy to the iPhone |
 
 Options that go before the command:
