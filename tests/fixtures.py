@@ -232,6 +232,10 @@ def make_backup(folder: Path, chatstorage: Path, password: str | None = None) ->
     add(WA_DOMAIN, "Message", None)
     add(WA_DOMAIN, CHATSTORAGE, chatstorage.read_bytes())
     add(WA_DOMAIN, CHATSTORAGE + "-wal", b"")
+    add("AppDomain-net.whatsapp.WhatsApp", "", None)
+    add("AppDomain-net.whatsapp.WhatsApp", "Library", None)
+    add("AppDomain-net.whatsapp.WhatsApp", "Library/Preferences", None)
+    add("AppDomain-net.whatsapp.WhatsApp", "Library/Preferences/net.whatsapp.WhatsApp.plist", b"prefs")
     add("HomeDomain", "", None)
     add("HomeDomain", "Library/Preferences/com.apple.example.plist", b"unrelated")
     conn.commit()
@@ -239,4 +243,10 @@ def make_backup(folder: Path, chatstorage: Path, password: str | None = None) ->
     plain = database.read_bytes()
     database.unlink()
     (folder / "Manifest.db").write_bytes(_cbc(manifest_key, plain) if password else plain)
+    return folder
+
+
+def mark_complete(folder: Path) -> Path:
+    """What `wamove backup`, `build` and `plant` leave next to a copy they finished."""
+    folder.with_name(folder.name + ".complete").write_text("test\n")
     return folder

@@ -13,7 +13,7 @@ import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pyiosbackup import Backup as ReferenceBackup
 
-from fixtures import (ALICE, BOB_LID, BOB_PN, GROUP, ME, PASSWORD, UDID, make_backup, make_chatstorage, make_media,
+from fixtures import (mark_complete, ALICE, BOB_LID, BOB_PN, GROUP, ME, PASSWORD, UDID, make_backup, make_chatstorage, make_media,
                       make_msgstore)
 from wamove.android import crypt15, msgstore
 from wamove.cli import main
@@ -206,6 +206,7 @@ def test_build_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     make_media(work / "android" / "Media")
     make_chatstorage(tmp_path / CHATSTORAGE)
     make_backup(work / "ios" / "pristine" / UDID, tmp_path / CHATSTORAGE, PASSWORD)
+    mark_complete(work / "ios" / "pristine" / UDID)
     before = (work / "ios" / "pristine" / UDID / "Manifest.db").read_bytes()
     monkeypatch.setenv("WAMOVE_BACKUP_PASSWORD", PASSWORD)
     assert main(["--work", str(work), "build"]) == 0

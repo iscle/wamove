@@ -8,6 +8,7 @@ import sqlite3
 import struct
 import subprocess
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,8 +30,34 @@ class BackupError(Exception):
     pass
 
 
+# Apple's file system representation decomposes like NFD except for these ranges, which it leaves alone.
+_KEPT = ((0x2000, 0x2FFF), (0xF900, 0xFAFF), (0x2F800, 0x2FAFF))
+
+
+def _kept(char: str) -> bool:
+    return any(low <= ord(char) <= high for low, high in _KEPT)
+
+
+def device_path(relative_path: str) -> str:
+    """The form the iPhone uses for a path: its file system representation. Its restore engine derives every file's
+    ID from it and aborts the whole restore ("Couldn't find file object for temporary restore path") when the ID in
+    Manifest.db was derived from another form, e.g. the composed "ó" of an Android file name."""
+    if relative_path.isascii():
+        return relative_path
+    out, run = [], []
+    for char in relative_path:
+        if _kept(char):
+            out.append(unicodedata.normalize("NFD", "".join(run)))
+            out.append(char)
+            run = []
+        else:
+            run.append(char)
+    out.append(unicodedata.normalize("NFD", "".join(run)))
+    return "".join(out)
+
+
 def file_id(domain: str, relative_path: str) -> str:
-    return hashlib.sha1(f"{domain}-{relative_path}".encode()).hexdigest()
+    return hashlib.sha1(f"{domain}-{device_path(relative_path)}".encode()).hexdigest()
 
 
 def clone_tree(src: Path, dst: Path) -> None:
@@ -114,6 +141,7 @@ class Backup:
         manifest = plistlib.loads((path / "Manifest.plist").read_bytes())
         self.encrypted = bool(manifest.get("IsEncrypted"))
         self.written: set[str] = set()
+        self.file_template: bytes | None = None
         self.keybag: Keybag | None = None
         if self.encrypted:
             if not password:
@@ -162,10 +190,15 @@ class Backup:
         return self.path / fid[:2] / fid
 
     def get(self, relative_path: str, domain: str = WA_DOMAIN) -> Entry | None:
+        relative_path = device_path(relative_path)
         row = self.conn.execute(
             "SELECT fileID, relativePath, flags, file FROM Files WHERE domain=? AND relativePath=?",
             (domain, relative_path)).fetchone()
         return Entry(*row) if row else None
+
+    def total_size(self) -> int:
+        return sum(int(mbfile(blob).get("Size") or 0)
+                   for (blob,) in self.conn.execute("SELECT file FROM Files WHERE flags=? AND file IS NOT NULL", (FILE,)))
 
     def count(self, domain: str = WA_DOMAIN) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM Files WHERE domain=?", (domain,)).fetchone()[0]
@@ -195,6 +228,8 @@ class Backup:
             return row[0]
         if prefer:
             return self._template(flags, domain)
+        if flags == FILE and self.file_template:
+            return self.file_template
         raise BackupError(f"the backup has no {'file' if flags == FILE else 'folder'} in {domain} to model on")
 
     def _folder_template(self, folder: str, domain: str) -> bytes:
@@ -245,6 +280,7 @@ class Backup:
         return key, digest.digest(), size
 
     def put(self, relative_path: str, source: Path, domain: str = WA_DOMAIN) -> None:
+        relative_path = device_path(relative_path)
         self._ensure_parents(relative_path, domain)
         existing = self.get(relative_path, domain)
         if existing and existing.flags == FILE and existing.blob:
@@ -266,9 +302,20 @@ class Backup:
             (fid, domain, relative_path, FILE, blob))
         self.written.add(fid)
 
-    def prune(self, domain: str = WA_DOMAIN) -> None:
-        keep = {r[0] for r in self.conn.execute("SELECT fileID FROM Files WHERE domain=?", (domain,))}
-        self.conn.execute("DELETE FROM Files WHERE domain<>?", (domain,))
+    def borrow_file_template(self, prefer_domain: str, protection: int = 3) -> bytes | None:
+        """A file's backup record (owner, mode, protection class), for a domain that has no files of its own yet."""
+        rows = self.conn.execute(
+            "SELECT domain, file FROM Files WHERE flags=? AND file IS NOT NULL AND domain LIKE 'AppDomain%' "
+            "ORDER BY domain<>?, domain", (FILE, prefer_domain))
+        for _, blob in rows:
+            if int(mbfile(blob).get("ProtectionClass") or 0) == protection:
+                return blob
+        return None
+
+    def prune(self, domains: tuple[str, ...] = (WA_DOMAIN,)) -> None:
+        marks = ",".join("?" for _ in domains)
+        keep = {r[0] for r in self.conn.execute(f"SELECT fileID FROM Files WHERE domain IN ({marks})", domains)}
+        self.conn.execute(f"DELETE FROM Files WHERE domain NOT IN ({marks})", domains)
         for bucket in self.path.iterdir():
             if bucket.is_dir() and len(bucket.name) == 2:
                 for payload in bucket.iterdir():
@@ -285,6 +332,8 @@ class Backup:
         if "" not in paths:
             problems.append("the WhatsApp folder itself is missing from the backup")
         for fid, relative_path, flags, blob in rows:
+            if fid != file_id(domain, relative_path):
+                problems.append(f"{relative_path}: its file ID is not the one the iPhone derives from its path")
             parent = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
             if relative_path and parent not in paths:
                 problems.append(f"{relative_path}: its folder is missing from the backup")

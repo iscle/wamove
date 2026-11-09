@@ -9,12 +9,15 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import __version__
 from .android import adb, crypt15, msgstore
+from .android import xpm as android_xpm
 from .ios import backup as ios_backup
 from .ios import chatstorage, device
+from .ios import xpm as ios_xpm
 from .model import Archive
 
 CHATSTORAGE = ios_backup.CHATSTORAGE
@@ -32,16 +35,19 @@ class Work:
         self.msgstore = self.android / "msgstore.db"
         self.media = self.android / "Media"
         self.contacts = self.android / "contacts.json"
+        self.export = self.android / "export"
+        self.mirror = self.android / "WhatsApp"
         self.full = root / "ios" / "full"
         self.pristine = root / "ios" / "pristine"
         self.patched = root / "ios" / "patched"
         self.build = root / "ios" / "build"
 
     def udid(self) -> str:
-        found = [p.name for p in self.pristine.iterdir() if (p / "Manifest.db").is_file()] \
+        found = [p.name for p in self.pristine.iterdir()
+                 if not p.name.endswith(".partial") and (p / "Manifest.db").is_file() and completed(p).is_file()] \
             if self.pristine.is_dir() else []
         if not found:
-            raise Failure("there is no iPhone backup yet; run `wamove backup` first")
+            raise Failure("there is no complete iPhone backup yet; run `wamove backup` first")
         if len(found) > 1:
             raise Failure(f"{self.pristine} holds more than one iPhone; remove the one you are not moving to")
         return found[0]
@@ -60,7 +66,33 @@ def secret(env: str, prompt: str, file: Path | None = None) -> str:
 def backup_password(path: Path) -> str | None:
     if not ios_backup.is_encrypted(path):
         return None
-    return secret("WAMOVE_BACKUP_PASSWORD", "iPhone backup password")
+    password = secret("WAMOVE_BACKUP_PASSWORD", "iPhone backup password")
+    if not password:
+        raise Failure("the iPhone backup is encrypted, so its password is needed")
+    return password
+
+
+def staging(final: Path) -> Path:
+    """A fresh folder to build `final` in; `publish` moves it into place only once it is complete."""
+    partial = final.with_name(final.name + ".partial")
+    shutil.rmtree(partial, ignore_errors=True)
+    shutil.rmtree(final, ignore_errors=True)
+    completed(final).unlink(missing_ok=True)
+    return partial
+
+
+def completed(final: Path) -> Path:
+    return final.with_name(final.name + ".complete")
+
+
+def publish(partial: Path, final: Path) -> None:
+    try:
+        if final.exists():
+            shutil.rmtree(final)
+        partial.rename(final)
+    except OSError as e:
+        raise Failure(f"could not move {partial} into place: {e}") from e
+    completed(final).write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"))
 
 
 def gigabytes(value: int) -> str:
@@ -102,8 +134,10 @@ def doctor(work: Work, args: argparse.Namespace) -> None:
     steps = [
         ("pull", work.crypt15.is_file()),
         ("decrypt", work.msgstore.is_file()),
-        ("backup", work.pristine.is_dir() and any(work.pristine.iterdir())),
-        ("build", work.patched.is_dir() and any(work.patched.iterdir())),
+        ("backup", work.pristine.is_dir() and any(completed(p).is_file() for p in work.pristine.iterdir()
+                                                  if p.is_dir() and not p.name.endswith(".partial"))),
+        ("build", work.patched.is_dir() and any(completed(p).is_file() for p in work.patched.iterdir()
+                                                 if p.is_dir() and not p.name.endswith(".partial"))),
     ]
     print("Done so far: " + (", ".join(name for name, done in steps if done) or "nothing"))
 
@@ -149,14 +183,17 @@ def backup(work: Work, args: argparse.Namespace) -> None:
     udid = device.backup(work.full, args.udid)
     full = work.full / udid
     password = backup_password(full)
-    for stale in (work.pristine / udid, work.patched / udid):
-        shutil.rmtree(stale, ignore_errors=True)
-    ios_backup.clone_tree(full, work.pristine / udid)
-    with ios_backup.Backup(work.pristine / udid, password) as saved:
-        saved.prune()
+    staging(work.patched / udid)
+    partial = staging(work.pristine / udid)
+    ios_backup.clone_tree(full, partial)
+    with ios_backup.Backup(partial, password) as saved:
+        saved.prune((ios_backup.WA_DOMAIN, ios_xpm.APP_DOMAIN))
+        if saved.get("", ios_xpm.APP_DOMAIN) is None:
+            raise Failure("WhatsApp is not in this backup: install it on the iPhone and back up again")
         if not saved.get(CHATSTORAGE):
-            raise Failure("WhatsApp is not in this backup: install it on the iPhone, register, and back up again")
-        count = saved.count()
+            print("  WhatsApp has no chat database yet (fresh install): only `wamove plant` can use this copy")
+        count = saved.count() + saved.count(ios_xpm.APP_DOMAIN)
+    publish(partial, work.pristine / udid)
     print(f"  full backup kept in {full}")
     print(f"  WhatsApp-only copy with {count} entries in {work.pristine / udid}")
 
@@ -170,10 +207,10 @@ def build(work: Work, args: argparse.Namespace) -> None:
     print_stats(archive)
     shutil.rmtree(work.build, ignore_errors=True)
     work.build.mkdir(parents=True)
-    shutil.rmtree(work.patched / udid, ignore_errors=True)
-    ios_backup.clone_tree(pristine, work.patched / udid)
+    partial = staging(work.patched / udid)
+    ios_backup.clone_tree(pristine, partial)
     database = work.build / CHATSTORAGE
-    with ios_backup.Backup(work.patched / udid, password) as target:
+    with ios_backup.Backup(partial, password) as target:
         for name in (CHATSTORAGE, CHATSTORAGE + "-wal"):
             target.read(name, work.build / name)
         writer = chatstorage.Writer(database, archive.lids)
@@ -204,6 +241,78 @@ def build(work: Work, args: argparse.Namespace) -> None:
         problems = target.check()
         if problems:
             raise Failure("the modified backup failed its checks:\n  " + "\n  ".join(problems[:20]))
+    publish(partial, work.patched / udid)
+    print(f"Ready to restore: {work.patched / udid}")
+
+
+def export(work: Work, args: argparse.Namespace) -> None:
+    print(f"Android: {adb.device()}")
+    android_xpm.require_root()
+    if work.export.exists() and any(work.export.iterdir()):
+        # Every export has its own key and IVs, so nothing of an earlier one may mix into it. Keep it aside.
+        previous = work.export.with_name(f"{work.export.name}.{time.strftime('%Y%m%d-%H%M%S')}")
+        work.export.rename(previous)
+        print(f"  kept the previous export in {previous}")
+    work.export.mkdir(mode=0o700, parents=True, exist_ok=True)
+    scratch = work.export / "msgstore-edit"
+    saved = None if args.keep_live_locations else android_xpm.clear_sent_live_location_finals(scratch)
+    try:
+        print("Running WhatsApp's own Move to iOS export. WhatsApp on Android logs out when it finishes.")
+        android_xpm.run_export()
+    finally:
+        if saved:
+            android_xpm.restore_sent_live_location_finals(scratch, saved)
+    collect(work, args)
+
+
+def collect(work: Work, args: argparse.Namespace) -> None:
+    """Copy the finished export off the Android phone (again) without running the exporter."""
+    android_xpm.require_root()
+    media = work.mirror if work.mirror.is_dir() else None
+    files, key = android_xpm.collect(work.export, media)
+    summary = ios_xpm.check_export(files, key, work.export, media)
+    chunks = summary["header"]["messages"]["chunks"]
+    print(f"  {len(chunks)} chunks, {sum(c['messages_count'] for c in chunks)} messages, {len(files)} files")
+
+
+def plant(work: Work, args: argparse.Namespace) -> None:
+    udid = work.udid()
+    pristine = work.pristine / udid
+    password = backup_password(pristine)
+    metadata = work.export / "migration_export_metadata.db"
+    if not metadata.is_file():
+        raise Failure("there is no Android export yet; run `wamove export` first")
+    if not (work.export / android_xpm.COLLECTED).is_file():
+        raise Failure("the Android export was not completely copied to this Mac; run `wamove collect` again")
+    files = android_xpm.exported_files(metadata)
+    key = android_xpm.find_key(work.export / "shared_prefs")
+    media = work.mirror if work.mirror.is_dir() else None
+    ios_xpm.check_export(files, key, work.export, media)
+    partial = staging(work.patched / udid)
+    ios_backup.clone_tree(pristine, partial)
+
+    def progress(done: int, total: int) -> None:
+        if done % 200 == 0 or done == total:
+            sys.stdout.write(f"\r  added {done}/{total} export files to the backup")
+            sys.stdout.flush()
+
+    template = None
+    if (work.full / udid / "Manifest.db").is_file():
+        full = ios_backup.Backup(work.full / udid, password)
+        try:
+            template = full.borrow_file_template(ios_xpm.APP_DOMAIN)
+        finally:
+            full.close()
+    with ios_backup.Backup(partial, password) as target:
+        if target.get("", ios_xpm.APP_DOMAIN) is None:
+            raise Failure("WhatsApp's app container is not in the iPhone backup; run `wamove backup` again")
+        target.file_template = template
+        ios_xpm.plant(target, files, key, work.export, media, work.build, progress)
+        print()
+        problems = target.check(ios_xpm.APP_DOMAIN) + target.check()
+        if problems:
+            raise Failure("the modified backup failed its checks:\n  " + "\n  ".join(problems[:20]))
+    publish(partial, work.patched / udid)
     print(f"Ready to restore: {work.patched / udid}")
 
 
@@ -233,19 +342,76 @@ def inspect(work: Work, args: argparse.Namespace) -> None:
 
 def restore(work: Work, args: argparse.Namespace, source: Path) -> None:
     udid = work.udid()
-    if not (source / udid / "Manifest.db").is_file():
-        raise Failure(f"nothing to restore in {source}; run `wamove build` first")
-    phone = device.phone(args.udid)
+    if args.udid and args.udid != udid:
+        raise Failure(f"the backup belongs to iPhone {udid}, not {args.udid}")
+    if not (source / udid / "Manifest.db").is_file() or not completed(source / udid).is_file():
+        what = "`wamove backup`" if source == work.pristine else "`wamove build` or `wamove plant`"
+        raise Failure(f"there is no complete copy to restore in {source}; run {what} first")
+    password = backup_password(source / udid)
+    try:
+        restoring = size_of(source / udid, password)  # also proves the password before the iPhone is involved
+    except ios_backup.BackupError as e:
+        raise Failure(f"{e}; nothing was sent to the iPhone") from e
+    added = restoring - size_of(work.pristine / udid, password) if source != work.pristine else 0
+    apps = device.apps_in_the_way()
+    if apps:
+        raise Failure(f"quit {', '.join(apps)} first: it talks to the iPhone, and the iPhone then cancels the restore")
+    print("Waiting until the iPhone is plugged in, unlocked and has finished starting up…")
+    device.wait_settled(udid)
+    phone = device.phone(udid)
     if phone.find_my:
         raise Failure("turn off Find My on the iPhone first (Settings > your name > Find My), then run this again")
     if phone.find_my is None:
         print("Could not tell whether Find My is on. If the restore fails, turn it off and try again.")
-    password = backup_password(source / udid)
-    print("Restoring WhatsApp's data to the iPhone. Keep it plugged in; it restarts when done.")
-    print("Afterwards it goes through its setup screens. The home screen layout may be reset and some apps,")
-    print("WhatsApp included, may need downloading again; their data stays.")
-    device.restore(source, udid, password, args.udid)
-    print("Done. Reinstall WhatsApp if its icon is faded, open it, then turn Find My back on.")
+    hotspot = device.usb_hotspot_interface(udid)
+    if hotspot:
+        raise Failure("turn off Personal Hotspot on the iPhone first (Settings > Personal Hotspot > Allow Others to "
+                      "Join): the iPhone drops it when the restore begins, and the USB reconfiguration that follows "
+                      "cuts the restore off")
+    if hotspot is None and device.CONNECTION == "USB":
+        print("Could not see the iPhone's USB interfaces. If the restore fails at 0%, turn off Personal Hotspot.")
+    stopped = device.stop_device_agents()
+    if stopped:
+        print(f"  stopped background helpers that talk to iPhones: {', '.join(stopped)} (they restart by themselves)")
+    apps = device.apps_in_the_way()
+    if apps:
+        raise Failure(f"quit {', '.join(apps)} first: it talks to the iPhone, and the iPhone then cancels the restore")
+    print("Restoring WhatsApp's data to the iPhone. Keep it unlocked and plugged in, and enter its passcode if it")
+    print("asks. Do not open WhatsApp until this finishes. The iPhone restarts at the end.")
+    try:
+        clean = device.restore(source, udid, password, trace=work.root / "logs" / f"restore-{time.strftime('%Y%m%d-%H%M%S')}.txt")
+    except device.RestoreNotStarted as e:
+        raise Failure(f"{e}. Nothing on the iPhone was changed; fix that and run this again.") from e
+    except device.RestoreCut as cut:
+        print(f"\n{cut}\n{cut.details}")
+        print("The iPhone restarts by itself after a failed restore; waiting for it before going on.")
+        device.wait_reboot(udid)
+        raise Failure("the restore did not finish. Do not open WhatsApp: its data may be half restored. "
+                      "Run `wamove restore` again, or `wamove rollback`.") from cut
+    if not clean:
+        print("\n  the iPhone reported 100% and dropped the connection while restarting")
+    print("The restore finished. The iPhone restarts now and may show its setup screens: unlock it and finish them.")
+    try:
+        device.wait_reboot(udid)
+        after = device.phone(udid).used_bytes
+    except device.DeviceError as e:
+        print(f"  could not check the iPhone afterwards ({e}); check its storage before opening WhatsApp")
+        after = None
+    if added > 0 and phone.used_bytes is not None and after is not None:
+        grown = after - phone.used_bytes
+        print(f"  the iPhone's used space grew by {gigabytes(grown)}; the restore added about {gigabytes(added)}")
+        if grown < added // 2:
+            print("  warning: that is much less than expected, so the data may not have landed. Check before "
+                  "opening WhatsApp.")
+    print("Done. Open WhatsApp, register your number, then turn Find My back on.")
+
+
+def size_of(path: Path, password: str | None) -> int:
+    saved = ios_backup.Backup(path, password)
+    try:
+        return saved.total_size()
+    finally:
+        saved.close()  # read-only: leaving a `with` block would save and rewrite Manifest.db
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -261,7 +427,12 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--no-media", action="store_true")
     command = commands.add_parser("decrypt", help="decrypt the Android backup with its 64-digit key")
     command.add_argument("--key-file", type=Path)
+    command = commands.add_parser("export", help="run WhatsApp's own Move to iOS export on the rooted Android phone")
+    command.add_argument("--keep-live-locations", action="store_true",
+                         help="do not work around the exporter crash on sent live locations")
+    commands.add_parser("collect", help="copy a finished export off the Android phone again, without exporting")
     commands.add_parser("backup", help="back up the iPhone and keep a WhatsApp-only copy")
+    commands.add_parser("plant", help="put the Android export where WhatsApp on the iPhone imports it from")
     command = commands.add_parser("build", help="add the Android chats to the WhatsApp-only copy")
     command.add_argument("--no-media", action="store_true")
     commands.add_parser("inspect", help="show what is in the Android chats and the iPhone backup")
@@ -274,14 +445,18 @@ def main(argv: list[str] | None = None) -> int:
         "doctor": lambda: doctor(work, args),
         "pull": lambda: pull(work, args),
         "decrypt": lambda: decrypt(work, args),
+        "export": lambda: export(work, args),
+        "collect": lambda: collect(work, args),
         "backup": lambda: backup(work, args),
+        "plant": lambda: plant(work, args),
         "build": lambda: build(work, args),
         "inspect": lambda: inspect(work, args),
         "restore": lambda: restore(work, args, work.patched),
         "rollback": lambda: restore(work, args, work.pristine),
     }
     known = (Failure, adb.AdbError, crypt15.Crypt15Error, msgstore.MsgstoreError, ios_backup.BackupError,
-             chatstorage.ChatStorageError, device.DeviceError)
+             chatstorage.ChatStorageError, device.DeviceError, android_xpm.ExportError,
+             ios_xpm.PlantError)
     try:
         actions[args.command]()
     except known as e:

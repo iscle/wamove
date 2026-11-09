@@ -12,7 +12,7 @@ license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = [
     "cryptography>=41",
-    "pymobiledevice3>=11.19",
+    "pymobiledevice3>=11.50.2",
 ]
 
 [project.scripts]
